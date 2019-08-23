@@ -9,26 +9,17 @@ use File::Basename;
 use YAML;
 use File::Temp;
 
-# Считываем конфиг и определеяем настройки подключения к БД
 my $dirname = dirname(__FILE__);
+use libs ($dirname);
+use Shared qw(open_db);
+
+# Считываем конфиг и определеяем настройки подключения к БД
 my $config = $dirname.'/config.yaml'
 if (! -e $config) {
     die "Config file '$config' not exists!";
 }
 
 my $cfg = YAML::Load($config);
-
-sub open_db {
-  my ($db_cfg, $options) = @_;
-  $options //= {AutoCommit => 1, RaiseError => 1, PrintError => 1};
-
-  return DBI->connect_cached(
-        "dbi:Pg:host=".$db_cfg->{ host }.";port=".$db_cfg->{ port }.";dbname=".$db_cfg->{ name },
-         $db_cfg->{ user },
-         $db_cfg->{ pass },
-         $options )
-      or die $DBI::errstr;
-};
 
 my $query = sub {
     my $env = shift;
