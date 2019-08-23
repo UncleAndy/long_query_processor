@@ -1,0 +1,23 @@
+db:
+  queue:
+    host: localhost
+    port: 5432
+    name: lqp_test
+    user: postgres
+    pass:
+  invoices:
+    host: localhost
+    port: 5432
+    name: lqp_test
+    user: postgres
+    pass:
+  organizations:
+    host: localhost
+    port: 5432
+    name: lqp_test
+    user: postgres
+    pass:
+processor:
+  max_forks: 5
+  sleep_max_forks: 10
+  sleep_no_queries: 3
