@@ -2,34 +2,45 @@
 
 use strict;
 
+BEGIN {
+    use FindBin;
+    use lib "$FindBin::RealBin/.";
+}
+
+use utf8;
+use Encode;
+
 use Plack;
 use Plack::Request;
 use Plack::Builder;
 use File::Basename;
-use YAML;
+use YAML::XS;
 use File::Temp;
+use Data::Dumper;
 
-my $dirname = dirname(__FILE__);
-use libs ($dirname);
-use Shared qw(open_db);
+use Shared;
+
+our $cfg;
 
 # Считываем конфиг и определеяем настройки подключения к БД
-my $config = $dirname.'/config.yaml'
+my $config = "$FindBin::RealBin/config.yaml";
 if (! -e $config) {
     die "Config file '$config' not exists!";
 }
 
-my $cfg = YAML::Load($config);
+$cfg = YAML::XS::LoadFile($config);
 
 my $query = sub {
     my $env = shift;
     my $req = Plack::Request->new( $env );
 
-    my $dbh = open_db( $cfg->{ db }->{ queue } );
+    my $dbh = Shared::open_db( $cfg->{ db }->{ queue } );
+
+    my $body = decode('utf8', $req->raw_body);
 
     # Добавляем запрос в очередь
     my $c = $dbh->prepare( 'INSERT INTO query_queue (query) VALUES (?) RETURNING id' );
-    $c->execute( $req->raw_body );
+    $c->execute( $body );
     my ($query_id) = $c->fetchrow_array();
     $c->finish;
 
@@ -45,7 +56,7 @@ my $result = sub {
     my $req = Plack::Request->new( $env );
     my $params = $req->parameters();
 
-    my $dbh = open_db( $cfg->{ db }->{ queue } );
+    my $dbh = Shared::open_db( $cfg->{ db }->{ queue } );
 
     # Проверяем в параметре наличие query_id
     if ( !$params->{ query_id } || $params->{ query_id } !~ /^[0-9]+$/ ) {
@@ -55,7 +66,7 @@ my $result = sub {
     }
 
     # Проверяем статус запроса
-    my $c = $dbh->prepare('SELECT status, notification FROM query_queue WHERE id = ?')
+    my $c = $dbh->prepare('SELECT status, notification FROM query_queue WHERE id = ?');
     $c->execute( $params->{ query_id } );
     my ($status, $notification) = $c->fetchrow_array();
     $c->finish;
@@ -82,7 +93,7 @@ my $result = sub {
     }
 
     # Если запрос обработан - формируем из данных результата CSV-файл
-    my $filename = "invoices_query_".$params->{ query_id }.".csv"
+    my $filename = "invoices_query_".$params->{ query_id }.".csv";
     $c = $dbh->prepare('SELECT period, owner_inn, owner_name, type, contractor_inn, contractor_name, date, number
                         FROM query_results
                         WHERE query_id = ?');
@@ -101,6 +112,7 @@ my $result = sub {
             $writer->write("period;owner_inn;owner_name;type;contractor_inn;contractor_name;date;number\n");
 
             while (my @row = $c->fetchrow_array()) {
+                @row = map { encode( 'utf8', $_ ) } @row;
                 $writer->write(join(';', @row)."\n");
             };
             $c->finish;
@@ -110,8 +122,9 @@ my $result = sub {
 
     # Если не доступен стриминг - формируем ответ через временный файл
     my $tmp = new File::Temp( UNLINK => 1 );
-    print $tmp "period;owner_inn;owner_name;type;contractor_inn;contractor_name;date;number\n"
+    print $tmp "period;owner_inn;owner_name;type;contractor_inn;contractor_name;date;number\n";
     while (my @row = $c->fetchrow_array()) {
+        @row = map { encode( 'utf8', $_ ) } @row;
         print $tmp join(';', @row)."\n";
     };
     $c->finish;

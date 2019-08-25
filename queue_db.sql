@@ -10,10 +10,10 @@ CREATE TABLE query_results (
    query_id BIGINT NOT NULL,
    period varchar NOT NULL,
    owner_inn varchar NOT NULL,
-   owner_name varchar NOT NULL,
+   owner_name varchar,
    type int NOT NULL,
    contractor_inn varchar NOT NULL,
-   contractor_name varchar NOT NULL,
+   contractor_name varchar,
    date varchar NOT NULL,
    number varchar NOT NULL
 );

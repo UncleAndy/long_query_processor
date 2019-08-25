@@ -3,16 +3,25 @@
 use strict;
 use warnings;
 
+BEGIN {
+    use FindBin;
+    use lib "$FindBin::RealBin/.";
+}
+
+use utf8;
+use Encode;
+
 use File::Basename;
-use YAML;
+use YAML::XS;
 use DBI;
 use POSIX;
 use JSON;
 use List::MoreUtils qw(uniq);
+use Data::Dumper;
 
-my $dirname = dirname(__FILE__);
-use libs ($dirname);
-use Shared qw(open_db);
+use Shared;
+
+our $cfg;
 
 # Пул работающих форков
 my $forks = {};
@@ -28,12 +37,12 @@ $SIG{CHLD} = sub {
 };
 
 # Считываем конфиг и определеяем настройки подключения к БД
-my $config = $dirname.'/config.yaml';
+my $config = "$FindBin::RealBin/config.yaml";
 if (! -e $config) {
     die "Config file '$config' not exists!";
 }
 
-my $cfg = YAML::Load($config);
+$cfg = YAML::XS::LoadFile($config);
 
 # Рабочий цикл
 while (1) {
@@ -46,21 +55,22 @@ while (1) {
     # Берем первый необработанный таск
     # Используем FOR UPDATE что-бы можно было запускать несколько экземпляров
     # процессоров (для горизонтального масштабирования)
-    my $queue_dbh = open_db( $cfg->{ db }->{ queue }, {AutoCommit => 0, RaiseError => 1, PrintError => 1} );
-    my $c = $queue_dbh->prepare('SELECT id, query FROM query_queue WHERE status = 0 ORDER BY id LIMIT 1 FOR UPDATE');
+    my $queue_dbh_master = Shared::open_db( $cfg->{ db }->{ queue }, {AutoCommit => 0, RaiseError => 1, PrintError => 1} );
+    my $c = $queue_dbh_master->prepare('SELECT id, query FROM query_queue WHERE status = 0 ORDER BY id LIMIT 1 FOR UPDATE');
     $c->execute();
     my ($query_id, $query) = $c->fetchrow_array();
     $c->finish;
 
     # Если нет необработанных - пауза и с начала цикла
     if ( !defined($query_id) ) {
-        $queue_dbh->commit;
+        $queue_dbh_master->commit;
         sleep $cfg->{ processor }->{ sleep_no_queries };
         next;
     }
 
-    $queue_dbh->do('UPDATE query_queue SET status = 1 WHERE id = ?', undef, $query_id);
-    $queue_dbh->commit;
+    $queue_dbh_master->do('UPDATE query_queue SET status = 1 WHERE id = ?', undef, $query_id);
+    $queue_dbh_master->commit;
+    $queue_dbh_master->disconnect;
 
     # Запускаем fork, передаем в него query_id и query и регистрируем его в $forks
     if ( my $child_pid = fork() ) {
@@ -68,7 +78,7 @@ while (1) {
         $forks->{ $child_pid } = { query_id => $query_id };
     } else {
         print "Working process $$ started...\n";
-        process_query( $queue_dbh, $query_id, $query );
+        process_query( $query_id, $query );
 
         # Завершаем дочерний процесс
         print "Working process $$ process finished\n";
@@ -77,7 +87,9 @@ while (1) {
 }
 
 sub process_query {
-    my ( $queue_dbh, $query_id, $query ) = @_;
+    my ( $query_id, $query ) = @_;
+
+    my $queue_dbh = Shared::open_db( $cfg->{ db }->{ queue }, {AutoCommit => 0, RaiseError => 1, PrintError => 1} );
 
     # Общий порядок работы:
     # 1. Проверяем есть-ли в условиях запроса фильтрация по имени организации-владельца или организации-контрагента
@@ -85,21 +97,19 @@ sub process_query {
     # 2. Формируем SQL запрос по таблице invoices на основе указанных фильтров и имеющихся временных таблиц
     # 3. Если в п.1. отсутствует одна из таблиц организации, формируем запрос на organizations для заполнения названий организаций
     my $params = {};
+    $query = encode('utf8', $query);
     eval {
         $params = decode_json($query);
     };
-    if ( defined($@) ) {
+    if ( $@ ) {
         $queue_dbh->do('UPDATE query_queue SET status = 3, notification = ? WHERE id = ?', undef,
             "ERROR: Can not parse JSON query: $@", $query_id);
         $queue_dbh->commit;
         return;
     }
 
-    my $inv_dbh = open_db( $cfg->{ db }->{ invoices }, {AutoCommit => 0, RaiseError => 1, PrintError => 1} );
-
-    # Если нужно - готовим коннект к БД организаций
-    my $org_dbh = open_db( $cfg->{ db }->{ organizations }, {AutoCommit => 1, RaiseError => 1, PrintError => 1} )
-        if $params->{ owner_name } || $params->{ contractor_name };
+    my $inv_dbh = Shared::open_db( $cfg->{ db }->{ invoices }, {AutoCommit => 0, RaiseError => 1, PrintError => 1} );
+    my $org_dbh = Shared::open_db( $cfg->{ db }->{ organizations }, {AutoCommit => 1, RaiseError => 1, PrintError => 1} );
 
     my $owner_name_table = '';
     if ( $params->{ owner_name } ) {
@@ -119,9 +129,9 @@ sub process_query {
     my $owner_name_table_sql = '';
     my $owner_name_where_sql = '';
     if ( $owner_name_table ne '' ) {
-        $owner_name_field_sql = ", on.name as owner_name ";
-        $owner_name_table_sql = ', '.$owner_name_table.' on ';
-        $owner_name_where_sql = ' AND  i.inn = on.inn ';
+        $owner_name_field_sql = ", own.name as owner_name ";
+        $owner_name_table_sql = ', '.$owner_name_table.' own ';
+        $owner_name_where_sql = ' AND  i.owner_inn = own.inn ';
     }
 
     my $contr_name_field_sql = '';
@@ -130,7 +140,7 @@ sub process_query {
     if ( $contr_name_table ne '' ) {
         $contr_name_field_sql = ", cn.name as contractor_name ";
         $contr_name_table_sql = ', '.$contr_name_table.' cn ';
-        $contr_name_where_sql = ' AND  i.inn = cn.inn ';
+        $contr_name_where_sql = ' AND  i.contractor_inn = cn.inn ';
     }
 
 
@@ -143,6 +153,7 @@ sub process_query {
             .$owner_name_field_sql.$contr_name_field_sql.'
         FROM invoices i'.$owner_name_table_sql.$contr_name_table_sql.'
         WHERE '.$main_where_sql.$owner_name_where_sql.$contr_name_where_sql;
+
     my $c = $inv_dbh->prepare($sql);
     $c->execute(@{$params_list});
     while ( my $row = $c->fetchrow_hashref() ) {
@@ -156,7 +167,8 @@ sub process_query {
     $c->finish;
 
     # Если не было поиска по какому-либо из имен - заполняем отдельно
-    fill_names($queue_dbh, $org_dbh, $query_id, $owner_name_table, $contr_name_table);
+    fill_names($queue_dbh, $org_dbh, $query_id, $owner_name_table, $contr_name_table)
+        if !$owner_name_table || !$contr_name_table;
 
     # Отмечаем запрос как исполненный
     $queue_dbh->do('UPDATE query_queue SET status = 2 WHERE id = ?', undef, $query_id);
@@ -172,7 +184,7 @@ sub create_name_table {
     # Выборка по имени организации
     my $c = $org_dbh->prepare('SELECT inn, name FROM organizations WHERE name LIKE ?');
     $c->execute( $find_str );
-    while ( my ($inn, $name) = fetchrow_array() ) {
+    while ( my ($inn, $name) = $c->fetchrow_array() ) {
         $inv_dbh->do('INSERT INTO '.$table_name.' (inn, name) VALUES (?, ?)', undef,
             $inn, $name);
     };
@@ -185,10 +197,10 @@ sub prepare_invoice_params {
     my $main_where_sql = '';
     my $params_list = ();
 
-    foreach my $field (@{list}) {
+    foreach my $field (@{$list}) {
         if ( defined( $params->{ $field } ) ) {
             $main_where_sql .= ' i.'.$field.' = ? ';
-            push @{$params_list}, $params->{ field };
+            push @{$params_list}, $params->{ $field };
         }
     }
 
@@ -209,7 +221,7 @@ sub fill_names {
         my $count = 0;
         my $c = $queue_dbh->prepare('SELECT id, owner_inn, contractor_inn
             FROM query_results
-            WHERE query_id = ?
+            WHERE query_id = ? AND ( owner_name IS NULL OR contractor_name IS NULL )
             ORDER BY id
             OFFSET ?
             LIMIT ?');
@@ -217,10 +229,13 @@ sub fill_names {
         while ( my ($id, $owner_inn, $contr_inn) = $c->fetchrow_array() ) {
             $count++;
 
-            $owner_recs->{$owner_inn} = $id if $owner_name_table eq '';
-            $contr_recs->{$contr_inn} = $id if $contr_name_table eq '';
+            $owner_recs->{$owner_inn} = 1 if $owner_name_table eq '';
+            $contr_recs->{$contr_inn} = 1 if $contr_name_table eq '';
         };
         $c->finish;
+
+        # Если больше нет записей в выборке, значит все обработали
+        last if $count == 0;
 
         # Сдвигаем смещение для следующей выборки
         $offset += $count;
@@ -230,19 +245,17 @@ sub fill_names {
         push @_inns, keys %{$contr_recs};
         my @inns = uniq(@_inns);
 
-        # Выбираем все ИНН по списку и обновляем имена в релультатах
-        my $params_list = ("?," x (length(@inns) - 1))."?";
+        # Выбираем все ИНН по списку и обновляем имена в результатах
+        my $params_list = ("?," x (scalar(@inns) - 1))."?";
+
         $c = $org_dbh->prepare('SELECT inn, name FROM organizations WHERE inn IN ('.$params_list.')');
         $c->execute(@inns);
         while ( my ($inn, $name) = $c->fetchrow_array() ) {
-            $queue_dbh->do('UPDATE query_results SET owner_name = ? WHERE id = ?', undef,
-                $name, $owner_recs->{$inn}) if defined( $owner_recs->{ $inn } );
-            $queue_dbh->do('UPDATE query_results SET contractor_name = ? WHERE id = ?', undef,
-                $name, $contr_recs->{$inn}) if defined( $contr_recs->{ $inn } );
+            $queue_dbh->do( 'UPDATE query_results SET owner_name = ? WHERE query_id = ? AND owner_inn = ?', undef,
+                $name, $query_id, $inn ) if defined( $owner_recs->{ $inn } );
+            $queue_dbh->do( 'UPDATE query_results SET contractor_name = ? WHERE query_id = ? AND contractor_inn = ?', undef,
+                $name, $query_id, $inn ) if defined( $contr_recs->{ $inn } );
         }
         $c->finish;
-
-        # Если больше нет записей в выборке, значит все обработали
-        last if $count = 0;
     }
 }

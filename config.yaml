@@ -4,19 +4,19 @@ db:
     port: 5432
     name: lqp_test
     user: postgres
-    pass:
+    pass: ''
   invoices:
     host: localhost
     port: 5432
     name: lqp_test
     user: postgres
-    pass:
+    pass: ''
   organizations:
     host: localhost
     port: 5432
     name: lqp_test
     user: postgres
-    pass:
+    pass: ''
 processor:
   max_forks: 5
   sleep_max_forks: 10
